@@ -158,10 +158,7 @@ const fetchFromNewsAPI = async (endpoint: string, params: any): Promise<Article[
 const deduplicateArticles = (articles: Article[]): Article[] => {
     const seenMap = new Map<string, boolean>();
     return articles.filter(article => {
-        // Create a unique key based on normalized title or URL
-        // Titles are often slightly different, but URL is usually unique.
-        // We'll try to use URL first, if not available, use Title.
-        const titleKey = article.title.toLowerCase().trim().slice(0, 50); // First 50 chars of title
+        const titleKey = article.title.toLowerCase().trim().slice(0, 50);
         const urlKey = article.url;
 
         if (seenMap.has(urlKey) || seenMap.has(titleKey)) {
@@ -174,17 +171,40 @@ const deduplicateArticles = (articles: Article[]): Article[] => {
 };
 
 const sortArticles = (articles: Article[]): Article[] => {
-    // Sort: Images first, then by date (newest first)
     return articles.sort((a, b) => {
-        // Prioritize images
         if (a.urlToImage && !b.urlToImage) return -1;
         if (!a.urlToImage && b.urlToImage) return 1;
-
-        // Then Sort by date
         const dateA = new Date(a.publishedAt).getTime();
         const dateB = new Date(b.publishedAt).getTime();
-        return dateB - dateA; // Descending
+        return dateB - dateA;
     });
+};
+
+// Strict Local Filter to remove irrelevant noise (like political news matching weak keywords)
+const isRelatedToAI = (article: Article): boolean => {
+    const text = `${article.title} ${article.description || ''} ${article.content || ''}`.toLowerCase();
+
+    // 1. Must NOT contain obvious exclude terms unless balanced by strong AI terms
+    const excludeTerms = ['cricket', 'football', 'murder', 'killed', 'politics', 'election', 'kashmir', 'gaza', 'israel', 'war', 'accident'];
+    const hasExcludeTerm = excludeTerms.some(term => text.includes(term));
+
+    // 2. Must contain at least one strong AI/Tech term
+    const strongKeywords = [
+        'ai ', 'artificial intelligence', 'machine learning', 'llm', 'chatgpt', 'openai',
+        'gemini', 'claude', 'nvidia', 'neural', 'robot', 'automation', 'algorithm',
+        'deep learning', 'generative', 'tech', 'technology', 'digital', 'cyber',
+        'compute', 'data center', 'processor', 'gpu', 'semiconductor'
+    ];
+
+    const hasStrongKeyword = strongKeywords.some(keyword => text.includes(keyword));
+
+    if (hasExcludeTerm) {
+        // Only allow if it ALSO has a very specific AI term (not just 'tech') to override the exclusion
+        const overrideTerms = ['artificial intelligence', 'machine learning', 'llm', 'chatgpt', 'openai', 'gemini', 'nvidia'];
+        return overrideTerms.some(term => text.includes(term));
+    }
+
+    return hasStrongKeyword;
 };
 
 // --- Main Service Functions ---
@@ -194,21 +214,23 @@ export const fetchAINews = async (pageSize = 20): Promise<Article[]> => {
         console.log('[NewsService] Starting aggregated fetch for AI News...');
 
         // 1. Define promises for each source
+        // 1. Define promises for each source
         const newsDataPromise = fetchFromNewsData({
             q: 'Artificial Intelligence,LLM,Gemini,Claude,Chatgpt,Ai Models',
             country: 'us,gb,ae,in,fr',
             category: 'technology,science,health,environment,education',
+            size: 10 // Reverted to 10: Free tier limit (50 caused 422 error)
         });
 
         const gNewsPromise = fetchFromGNews({
             q: AI_STRICT_QUERY,
-            max: pageSize
+            max: Math.min(pageSize, 100) // GNews max is 100, but free is 10. We ask for 100, API handles it.
         });
 
         const newsApiPromise = fetchFromNewsAPI('everything', {
             q: AI_STRICT_QUERY,
             sortBy: 'publishedAt',
-            pageSize,
+            pageSize: Math.min(pageSize, 100), // NewsAPI max is 100
         });
 
         // 2. Wait for all to settle
@@ -231,8 +253,9 @@ export const fetchAINews = async (pageSize = 20): Promise<Article[]> => {
             }
         });
 
-        // 4. Deduplicate & Sort
-        const uniqueArticles = deduplicateArticles(allArticles);
+        // 4. Local Filter, Deduplicate & Sort
+        const filteredArticles = allArticles.filter(isRelatedToAI);
+        const uniqueArticles = deduplicateArticles(filteredArticles);
         const finalArticles = sortArticles(uniqueArticles);
 
         console.log(`
@@ -272,26 +295,50 @@ export const searchNews = async (query: string, pageSize = 10): Promise<Article[
         const gNewsPromise = fetchFromGNews({
             q: finalQuery,
             sortby: 'relevance',
-            max: pageSize
+            max: Math.min(pageSize, 100)
         });
 
         const newsApiPromise = fetchFromNewsAPI('everything', {
             q: finalQuery,
             sortBy: 'relevancy',
-            pageSize
+            pageSize: Math.min(pageSize, 100)
         });
 
         const results = await Promise.allSettled([newsDataPromise, gNewsPromise, newsApiPromise]);
 
         let allArticles: Article[] = [];
+
+        // Log detailed breakdown
+        const newsDataCount = results[0].status === 'fulfilled' ? results[0].value.length : 0;
+        const gNewsCount = results[1].status === 'fulfilled' ? results[1].value.length : 0;
+        const newsApiCount = results[2].status === 'fulfilled' ? results[2].value.length : 0;
+        const newsDataStatus = results[0].status;
+        const gNewsStatus = results[1].status;
+        const newsApiStatus = results[2].status;
+
         results.forEach(result => {
             if (result.status === 'fulfilled') {
                 allArticles = [...allArticles, ...result.value];
             }
         });
 
-        const uniqueArticles = deduplicateArticles(allArticles);
+        const filteredArticles = allArticles.filter(isRelatedToAI);
+        const uniqueArticles = deduplicateArticles(filteredArticles);
         const finalArticles = sortArticles(uniqueArticles);
+
+        console.log(`
+[Search Service Integration Summary]
+----------------------------------------
+Source      | Status      | Count
+----------------------------------------
+NewsData.io | ${newsDataStatus === 'fulfilled' ? 'OK' : 'ERR'}          | ${newsDataCount}
+GNews       | ${gNewsStatus === 'fulfilled' ? 'OK' : 'ERR'}          | ${gNewsCount}
+NewsAPI     | ${newsApiStatus === 'fulfilled' ? 'OK' : 'ERR'}          | ${newsApiCount}
+----------------------------------------
+Total Raw   |             | ${allArticles.length}
+Unique      |             | ${finalArticles.length}
+----------------------------------------
+        `);
 
         return finalArticles;
     } catch (error) {
@@ -308,35 +355,58 @@ export const fetchNewsByCountry = async (countryCode: string, countryName: strin
         const newsDataPromise = fetchFromNewsData({
             q: 'Artificial Intelligence, Global Tech',
             country: countryCode.toLowerCase(), // Note: NewsData might not support all codes
+            size: 10, // Reverted to 10: Free tier limit (50 caused 422 error)
         });
 
         // GNews
         const gNewsPromise = fetchFromGNews({
             q: AI_STRICT_QUERY,
             country: countryCode.toLowerCase(),
-            max: pageSize
+            max: Math.min(pageSize, 100)
         });
 
         // NewsAPI (Top Headlines for better country precision)
         const newsApiPromise = fetchFromNewsAPI('top-headlines', {
             country: countryCode.toLowerCase(),
             category: 'technology',
-            pageSize
+            pageSize: Math.min(pageSize, 100)
         });
 
         const results = await Promise.allSettled([newsDataPromise, gNewsPromise, newsApiPromise]);
 
         let allArticles: Article[] = [];
+
+        // Log detailed breakdown
+        const newsDataCount = results[0].status === 'fulfilled' ? results[0].value.length : 0;
+        const gNewsCount = results[1].status === 'fulfilled' ? results[1].value.length : 0;
+        const newsApiCount = results[2].status === 'fulfilled' ? results[2].value.length : 0;
+        const newsDataStatus = results[0].status;
+        const gNewsStatus = results[1].status;
+        const newsApiStatus = results[2].status;
+
         results.forEach(result => {
             if (result.status === 'fulfilled') {
                 allArticles = [...allArticles, ...result.value];
             }
         });
 
-        const uniqueArticles = deduplicateArticles(allArticles);
+        const filteredArticles = allArticles.filter(isRelatedToAI);
+        const uniqueArticles = deduplicateArticles(filteredArticles);
         const finalArticles = sortArticles(uniqueArticles);
 
-        console.log(`[NewsService] Found ${finalArticles.length} aggregated articles for ${countryCode}.`);
+        console.log(`
+[Country News Service Integration Summary - ${countryCode}]
+----------------------------------------
+Source      | Status      | Count
+----------------------------------------
+NewsData.io | ${newsDataStatus === 'fulfilled' ? 'OK' : 'ERR'}          | ${newsDataCount}
+GNews       | ${gNewsStatus === 'fulfilled' ? 'OK' : 'ERR'}          | ${gNewsCount}
+NewsAPI     | ${newsApiStatus === 'fulfilled' ? 'OK' : 'ERR'}          | ${newsApiCount}
+----------------------------------------
+Total Raw   |             | ${allArticles.length}
+Unique      |             | ${finalArticles.length}
+----------------------------------------
+        `);
         return finalArticles;
 
     } catch (error) {
